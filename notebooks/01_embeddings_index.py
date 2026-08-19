@@ -16,9 +16,10 @@
 # %%
 import _setup  # noqa: F401  -- adds repo root to sys.path
 import json
+import os
 from pathlib import Path
 
-from fastembed import TextEmbedding
+from app.embeddings import Embedder, describe
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 
@@ -42,7 +43,7 @@ print(f"First doc:")
 print(json.dumps(docs[0], ensure_ascii=False, indent=2))
 
 # %% [markdown]
-# ## 2. Embedding model: `BAAI/bge-small-en-v1.5`
+# ## 2. Embedding model: multilingual MiniLM
 #
 # `fastembed` chạy ONNX → CPU friendly, không cần GPU. 384-dim vectors.
 #
@@ -51,7 +52,8 @@ print(json.dumps(docs[0], ensure_ascii=False, indent=2))
 # > Cho lab này dùng `bge-small-en` để mọi laptop chạy được nhanh.
 
 # %%
-embedder = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+embedder = Embedder()
+print("Embedding backend:", describe())
 sample = list(embedder.embed(["cloud computing tiếng Việt"]))[0]
 print(f"Vector dim: {len(sample)}")
 print(f"First 8 values: {sample[:8].tolist()}")
@@ -67,11 +69,11 @@ print(f"First 8 values: {sample[:8].tolist()}")
 client = QdrantClient(":memory:")
 client.create_collection(
     collection_name="lab19",
-    vectors_config=VectorParams(size=384, distance=Distance.COSINE),
+    vectors_config=VectorParams(size=embedder.dim, distance=Distance.COSINE),
 )
 
 # %% [markdown]
-# ## 4. TODO — embed + upsert toàn bộ corpus
+# ## 4. Implementation — embed + upsert toàn bộ corpus
 #
 # Embed `title + " " + text` cho từng doc, batch theo 64 docs/lần (fastembed
 # CPU-bound, batch=64 là sweet spot). Upsert vào Qdrant collection `lab19`.
@@ -79,7 +81,7 @@ client.create_collection(
 # **Hint:** xem `app/search.py` `_build_vector_index()` để tham khảo pattern.
 
 # %%
-# TODO: implement the embed + upsert loop here.
+# Completed implementation: batch embed + upsert with a hard count assertion.
 # Expected outcome: client.count("lab19") == 1000
 # (~30 seconds on first run as fastembed downloads the model.)
 
@@ -132,6 +134,9 @@ hits2 = client.query_points(collection_name="lab19", query=q_vec2, limit=5).poin
 print(f"Query (paraphrase): {query2!r}")
 for h in hits2:
     print(f"  [{h.payload['topic']:>9}] score={h.score:.3f}  {h.payload['title']}")
+cloud_count = sum(h.payload["topic"] == "cloud" for h in hits2)
+print(f"Cloud dominance: {cloud_count}/5")
+assert cloud_count >= 3, f"paraphrase top-5 is not dominated by cloud ({cloud_count}/5)"
 
 # %% [markdown]
 # ## Deliverable evidence (chụp màn hình)

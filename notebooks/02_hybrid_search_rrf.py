@@ -19,10 +19,11 @@
 # %%
 import _setup  # noqa: F401
 import json
+import os
 import statistics
 from pathlib import Path
 
-from fastembed import TextEmbedding
+from app.embeddings import Embedder, describe
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 from rank_bm25 import BM25Okapi
@@ -40,11 +41,12 @@ tokenized = [(d["title"] + " " + d["text"]).lower().split() for d in docs]
 bm25 = BM25Okapi(tokenized)
 
 # Vector
-embedder = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+embedder = Embedder()
+print("Embedding backend:", describe())
 client = QdrantClient(":memory:")
 client.create_collection(
     collection_name="lab19",
-    vectors_config=VectorParams(size=384, distance=Distance.COSINE),
+    vectors_config=VectorParams(size=embedder.dim, distance=Distance.COSINE),
 )
 BATCH = 64
 points = []
@@ -81,7 +83,7 @@ def search_semantic(query: str, top_k: int = TOP_K) -> list[str]:
 
 
 # %% [markdown]
-# ## 3. TODO — implement Reciprocal Rank Fusion
+# ## 3. Implementation — Reciprocal Rank Fusion
 #
 # Công thức (deck §3):
 #
@@ -100,7 +102,7 @@ def search_hybrid(query: str, top_k: int = TOP_K, rrf_k: int = RRF_K) -> list[st
     kw_ids = search_keyword(query, depth)
     sem_ids = search_semantic(query, depth)
 
-    # TODO: implement RRF fusion below.
+    # RRF fusion. The two inputs are ranks, never raw BM25/cosine scores.
     # Hint: dict[doc_id, float] cộng 1/(rrf_k + rank) từ mỗi retriever.
     # rank starts at 1, not 0.
     rrf: dict[str, float] = {}
@@ -147,6 +149,8 @@ print(f"Precision@10 (avg over {len(golden)} queries):")
 print(f"  Keyword (BM25)   : {statistics.mean(p_kw):.1%}")
 print(f"  Semantic (vector): {statistics.mean(p_sem):.1%}")
 print(f"  Hybrid  (RRF=60) : {statistics.mean(p_hyb):.1%}   <- should win")
+assert statistics.mean(p_hyb) > statistics.mean(p_kw)
+assert statistics.mean(p_hyb) > statistics.mean(p_sem)
 
 # %% [markdown]
 # ## 5. Slice theo loại query
@@ -170,6 +174,10 @@ for t in ("exact", "paraphrase", "mixed"):
           f"{statistics.mean(m['kw']):>6.1%} "
           f"{statistics.mean(m['sem']):>6.1%} "
           f"{statistics.mean(m['hyb']):>6.1%}")
+
+assert statistics.mean(by_type["mixed"]["hyb"]) >= statistics.mean(by_type["mixed"]["kw"])
+assert statistics.mean(by_type["mixed"]["hyb"]) >= statistics.mean(by_type["mixed"]["sem"])
+assert statistics.mean(by_type["exact"]["kw"]) >= statistics.mean(by_type["exact"]["sem"])
 
 # %% [markdown]
 # ### Diễn giải kết quả

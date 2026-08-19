@@ -48,6 +48,8 @@ BACKENDS: dict[str, BackendSpec] = {
 }
 
 
+
+
 class Embedder:
     """Uniform `.embed(list[str]) -> Iterator[np.ndarray]`, matching fastembed."""
 

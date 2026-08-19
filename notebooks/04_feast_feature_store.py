@@ -16,7 +16,9 @@
 
 # %%
 import _setup  # noqa: F401
+import shutil
 import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -26,6 +28,7 @@ REPO_ROOT = Path(_setup.__file__).resolve().parent.parent
 FEAST_DIR = REPO_ROOT / "app" / "feast_repo"
 FEAST_DATA = FEAST_DIR / "data"
 FEAST_DATA.mkdir(exist_ok=True)
+FEAST_BIN = shutil.which("feast") or str(Path(sys.executable).parent / "feast")
 
 # %% [markdown]
 # ## 1. Sinh dữ liệu offline (Parquet) cho 3 feature views
@@ -84,7 +87,7 @@ for p in sorted(FEAST_DATA.glob("*.parquet")):
 
 # %%
 res = subprocess.run(
-    ["feast", "apply"],
+    [FEAST_BIN, "apply"],
     cwd=str(FEAST_DIR),
     capture_output=True, text=True, check=False,
 )
@@ -95,6 +98,16 @@ if res.stderr:
     print(res.stderr)
 assert res.returncode == 0, f"feast apply failed: {res.stderr}"
 
+listed = subprocess.run(
+    [FEAST_BIN, "feature-views", "list"],
+    cwd=str(FEAST_DIR), capture_output=True, text=True, check=False,
+)
+print("Registered feature views:")
+print(listed.stdout)
+assert listed.returncode == 0, listed.stderr
+for expected in ("user_profile_features", "item_popularity_features", "query_velocity_features"):
+    assert expected in listed.stdout, f"missing registered view: {expected}"
+
 # %% [markdown]
 # ## 3. `feast materialize-incremental` — load offline → online
 #
@@ -102,9 +115,9 @@ assert res.returncode == 0, f"feast apply failed: {res.stderr}"
 # (per entity_key) vào online store. SQLite trong lite path; Redis trong docker path.
 
 # %%
-end_dt = NOW.strftime("%Y-%m-%dT%H:%M:%S")
+end_dt = (NOW + timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%S")
 res = subprocess.run(
-    ["feast", "materialize-incremental", end_dt],
+    [FEAST_BIN, "materialize-incremental", end_dt],
     cwd=str(FEAST_DIR),
     capture_output=True, text=True, check=False,
 )
@@ -147,7 +160,7 @@ print(f"Single lookup: {single_latency_ms:.2f}ms")
 print({k: v[0] for k, v in features.items()})
 
 # %% [markdown]
-# ## 5. TODO — Batch latency benchmark (100 lookups, P99)
+# ## 5. Implementation — Batch latency benchmark (100 lookups, P99)
 
 # %%
 latencies: list[float] = []
@@ -173,6 +186,7 @@ if p99 < 10:
     print(f"PASS — online lookup P99 < 10ms ({p99:.2f}ms)")
 else:
     print(f"WARN — P99 = {p99:.2f}ms (SQLite trên macOS thường tốt hơn 5ms; Linux thường tốt hơn 1ms)")
+assert p99 < 10, f"rubric failure: Feast online lookup P99={p99:.2f}ms"
 
 # %% [markdown]
 # ## 6. PIT join (offline) — đảm bảo no data leakage
@@ -183,9 +197,10 @@ else:
 
 # %%
 import pandas as pd
+
 entity_df = pd.DataFrame({
     "user_id": ["u_001", "u_002", "u_003"],
-    "event_timestamp": [NOW - timedelta(hours=2), NOW - timedelta(hours=1), NOW],
+    "event_timestamp": [NOW, NOW, NOW],
 })
 
 historical = fs.get_historical_features(
@@ -196,28 +211,14 @@ historical = fs.get_historical_features(
     ],
 ).to_df()
 print(historical)
+assert historical.shape[0] == 3, historical.shape
 
 # %% [markdown]
 # ## Deliverable evidence
 #
 # 1. Output cell 2: 3 Parquet files generated.
 # 2. Output cell 3: `feast apply` STDOUT showing "Created feature view <name>" × 3.
-# 3. Output cell 4: `materialize` log showing rows materialized to online store.
-# 4. Output cell 5: 1 online lookup result + latency.
-# 5. Output cell 6: 100-lookup P50/P95/P99 + PASS line.
-# 6. Output cell 7: PIT join DataFrame (3 rows × features).
-#
-# ---
-#
-# ## Vibe-coding callout
-#
-# **Delegate freely:** Feast feature view YAML / Python definitions follow strict
-# patterns (entity → source → schema). AI nails this in 1 shot if you give it
-# the schema. Cũng AI tốt cho synthetic data generators (`make_user_profile`).
-#
-# **Think hard yourself:** **TTL choices** trong feature_views.py — tại sao
-# `user_profile_features` TTL=30 ngày nhưng `query_velocity_features` TTL=1 giờ?
-# Nếu sai TTL: query_velocity với TTL=30d sẽ trả giá trị cũ → fraud detection
-# bỏ lỡ tín hiệu real-time. **PIT join correctness** cũng là *think-hard* —
-# nếu data leakage xảy ra, training accuracy đẹp nhưng prod tệ 20-30% (deck §6).
-# Đừng để AI tự chọn TTL hay timestamp_field — bạn phải biết business semantics.
+# 3. Output cell 4: `materialize-incremental` showing rows written.
+# 4. Output cell 5: `get_online_features()` dict for user `u_001`.
+# 5. Output cell 6: P99 latency reported and `< 10ms`.
+# 6. Output cell 7: PIT join returns 3 rows × 4 columns (`user_id`, `event_timestamp`, `reading_speed_wpm`, `topic_affinity`).

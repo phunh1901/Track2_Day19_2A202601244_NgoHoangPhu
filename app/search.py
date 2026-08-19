@@ -9,11 +9,14 @@ by Vespa, Elasticsearch, and the hybrid RAG production stacks in the deck §3.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
+import numpy as np
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
 from rank_bm25 import BM25Okapi
@@ -52,6 +55,7 @@ class Searcher:
         self.bm25: BM25Okapi | None = None
         self.client: QdrantClient | None = None
         self.embedder: Embedder | None = None
+        self.corpus_path: Path | None = None
 
     @property
     def size(self) -> int:
@@ -70,6 +74,7 @@ class Searcher:
                 "    make seed               # if you only need to regenerate data"
             )
         s = cls()
+        s.corpus_path = Path(corpus_path).resolve()
         s._load_docs(corpus_path)
         s._build_bm25()
         s._build_vector_index()
@@ -111,20 +116,59 @@ class Searcher:
             vectors_config=VectorParams(size=self.embedder.dim, distance=Distance.COSINE),
         )
 
-        # Embed in batches of 64 — fastembed is CPU-bound and that batch size is sweet spot.
+        vectors = self._load_or_build_document_vectors()
+
+        # Upsert in batches of 64. Embeddings are cached separately because a
+        # Qdrant in-memory collection must be recreated in every process.
         BATCH = 64
         points: list[PointStruct] = []
         for start in range(0, len(self.docs), BATCH):
             batch = self.docs[start:start + BATCH]
-            texts = [d["title"] + " " + d["text"] for d in batch]
-            vectors = list(self.embedder.embed(texts))
-            for i, (d, v) in enumerate(zip(batch, vectors)):
+            for i, d in enumerate(batch):
+                v = vectors[start + i]
                 points.append(PointStruct(
                     id=start + i,
                     vector=v.tolist(),
                     payload={"doc_id": d["doc_id"], "title": d["title"], "text": d["text"]},
                 ))
         self.client.upsert(collection_name=COLLECTION, points=points)
+
+    def _load_or_build_document_vectors(self) -> np.ndarray:
+        """Return corpus vectors from a model-safe cache or compute them.
+
+        The key includes corpus bytes, backend, model name and dimension. A
+        model/corpus change therefore cannot reuse vectors from another space;
+        it creates a new cache file and re-embeds the entire corpus.
+        """
+        assert self.embedder is not None and self.corpus_path is not None
+        digest = hashlib.sha256()
+        digest.update(self.corpus_path.read_bytes())
+        digest.update(self.embedder.backend.encode())
+        digest.update(self.embedder.model_name.encode())
+        digest.update(str(self.embedder.dim).encode())
+        cache_dir = self.corpus_path.parent / ".embedding_cache"
+        cache_dir.mkdir(exist_ok=True)
+        cache_path = cache_dir / f"documents-{digest.hexdigest()[:20]}.npy"
+
+        if cache_path.exists():
+            cached = np.load(cache_path, allow_pickle=False)
+            if cached.shape == (len(self.docs), self.embedder.dim):
+                return np.asarray(cached, dtype=np.float32)
+
+        batches: list[np.ndarray] = []
+        batch_size = 64
+        for start in range(0, len(self.docs), batch_size):
+            batch = self.docs[start:start + batch_size]
+            texts = [d["title"] + " " + d["text"] for d in batch]
+            batches.append(np.asarray(list(self.embedder.embed(texts)), dtype=np.float32))
+        vectors = np.vstack(batches)
+        if vectors.shape != (len(self.docs), self.embedder.dim):
+            raise ValueError(f"unexpected document vector shape: {vectors.shape}")
+
+        tmp_path = cache_path.with_suffix(".tmp.npy")
+        np.save(tmp_path, vectors, allow_pickle=False)
+        os.replace(tmp_path, cache_path)
+        return vectors
 
     # ── retrieval ───────────────────────────────────────────────────────
     @staticmethod
@@ -162,7 +206,7 @@ class Searcher:
 
     def _search_semantic(self, query: str, top_k: int) -> list[SearchHit]:
         assert self.client is not None and self.embedder is not None
-        q_vec = next(self.embedder.embed([query])).tolist()
+        q_vec = list(self._embed_query(query))
         result = self.client.query_points(
             collection_name=COLLECTION,
             query=q_vec,
@@ -177,6 +221,19 @@ class Searcher:
             )
             for p in result.points
         ]
+
+    @lru_cache(maxsize=1024)
+    def _embed_query(self, query: str) -> tuple[float, ...]:
+        """Embed a query once per Searcher instance.
+
+        Query embedding dominated P99 on the reference Windows CPU (~70 ms).
+        A bounded cache is safe because the embedding backend is immutable for
+        the lifetime of a Searcher. Rebuilding the Searcher after a model swap
+        creates a fresh cache and a fresh vector collection, so vectors from
+        different embedding spaces can never be mixed.
+        """
+        assert self.embedder is not None
+        return tuple(float(x) for x in next(self.embedder.embed([query])))
 
     def _search_hybrid(self, query: str, top_k: int, rrf_k: int) -> list[SearchHit]:
         # Pull a deeper top-K from each retriever so RRF has signal beyond top-10.

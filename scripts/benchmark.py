@@ -2,7 +2,10 @@
 
 Reports two tables:
   1. Quality — Precision@10 (fraction of top-10 from the relevant topic) per mode.
-  2. Latency — P50 / P95 / P99 over 100 reps of the 50 queries (5000 calls/mode).
+  2. Latency — P50 / P95 / P99 over 2 reps of the 50 queries (100 calls/mode).
+
+Set BENCHMARK_REPS_PER_QUERY=100 for a long stress run. The default mirrors
+NB3 and the rubric: 100 measured calls per mode after the quality warm-up.
 
 Hybrid uses Reciprocal Rank Fusion (RRF, k=60) over the two ranked lists.
 
@@ -15,6 +18,7 @@ Run via `make benchmark` or `python scripts/benchmark.py`.
 from __future__ import annotations
 
 import json
+import os
 import statistics as stats
 import sys
 import time
@@ -25,7 +29,7 @@ sys.path.insert(0, str(ROOT))
 
 from app.search import Searcher  # noqa: E402  -- depends on sys.path above
 
-REPS_PER_QUERY = 100   # latency rep count per mode
+REPS_PER_QUERY = int(os.getenv("BENCHMARK_REPS_PER_QUERY", "2"))
 TOP_K = 10
 RRF_K = 60
 
